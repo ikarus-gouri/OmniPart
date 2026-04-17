@@ -4,3 +4,4 @@ ckpt/
 .DS_Store
 tmp/
 debug_images/
+.trunk/

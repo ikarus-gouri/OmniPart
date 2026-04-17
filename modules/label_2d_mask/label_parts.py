@@ -105,13 +105,17 @@ def clean_segment_edges(group_ids):
 
 
 def prepare_image(image, bg_color=None, rmbg_net=None):
+    if rmbg_net is None:
+        return image.convert("RGBA")
+
     image_size = (1024, 1024)
     transform_image = transforms.Compose([
         transforms.Resize(image_size),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    input_images = transform_image(image).unsqueeze(0).to('cuda')
+    device = next(rmbg_net.parameters()).device
+    input_images = transform_image(image).unsqueeze(0).to(device)
 
     # Prediction
     with torch.no_grad():
@@ -246,13 +250,14 @@ def split_disconnected_parts(group_ids, size_threshold=None):
 # -------------------------------------------------------
 
 def get_sam_mask(image, mask_generator, visual, merge_groups=None, existing_group_ids=None, 
-                check_undetected=True, rgba_image=None, img_name=None, skip_split=False, save_dir=None, size_threshold=None):
+                check_undetected=True, rgba_image=None, img_name=None, skip_split=False, save_dir=None, size_threshold=None, precomputed_masks=None):
     """
     Generate and process SAM masks for the image, with optional merging and undetected region detection.
     
     Args:
         size_threshold: Minimum size threshold for considering a segment (in pixels). 
                        If None, uses the global size_th variable.
+        precomputed_masks: Optional SAM masks to reuse instead of calling mask_generator.generate(image).
     """
     # Use provided threshold or fall back to global variable
     if size_threshold is None:
@@ -269,7 +274,7 @@ def get_sam_mask(image, mask_generator, visual, merge_groups=None, existing_grou
         exist_group = True
     else:
         # Generate masks using SAM
-        masks = mask_generator.generate(image)
+        masks = precomputed_masks if precomputed_masks is not None else mask_generator.generate(image)
         group_ids = np.full((image.shape[0], image.shape[1]), -1, dtype=int)
         num_masks = len(masks)
         group_counter = 0

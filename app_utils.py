@@ -17,10 +17,8 @@ from modules.part_synthesis.process_utils import save_parts_outputs
 from modules.inference_utils import load_img_mask, prepare_bbox_gen_input, prepare_part_synthesis_input, gen_mesh_from_bounds, vis_voxel_coords, merge_parts
 from modules.part_synthesis.pipelines import OmniPartImageTo3DPipeline
 from modules.label_2d_mask.visualizer import Visualizer
-from transformers import AutoModelForImageSegmentation
 
 from modules.label_2d_mask.label_parts import (
-    prepare_image, 
     get_sam_mask, 
     get_mask, 
     clean_segment_edges,
@@ -35,48 +33,182 @@ MAX_SEED = np.iinfo(np.int32).max
 TMP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 os.makedirs(TMP_ROOT, exist_ok=True)
 
+# Keep SAM lightweight on low-VRAM GPUs; can be overridden via env vars.
+SAM_MIN_CUDA_VRAM_GB = float(os.getenv("OMNIPART_SAM_MIN_CUDA_VRAM_GB", "10"))
+SAM_GENERATOR_CONFIG = {
+    "points_per_side": int(os.getenv("OMNIPART_SAM_POINTS_PER_SIDE", "16")),
+    "points_per_batch": int(os.getenv("OMNIPART_SAM_POINTS_PER_BATCH", "32")),
+    "crop_n_layers": int(os.getenv("OMNIPART_SAM_CROP_N_LAYERS", "0")),
+    "crop_n_points_downscale_factor": int(os.getenv("OMNIPART_SAM_CROP_DOWNSCALE", "2")),
+}
+
 sam_mask_generator = None
-rmbg_model = None
+sam_device = None
 bbox_gen_model = None
 part_synthesis_pipeline = None
+bbox_gen_ckpt_path_cached = None
+partfield_ckpt_path_cached = None
 
 size_th = DEFAULT_SIZE_TH
 
 
 def prepare_models(sam_ckpt_path, partfield_ckpt_path, bbox_gen_ckpt_path):
-    global sam_mask_generator, rmbg_model, bbox_gen_model, part_synthesis_pipeline
+    global sam_mask_generator, sam_device
+    global bbox_gen_ckpt_path_cached, partfield_ckpt_path_cached
+
+    bbox_gen_ckpt_path_cached = bbox_gen_ckpt_path
+    partfield_ckpt_path_cached = partfield_ckpt_path
+
     if sam_mask_generator is None:
         print("Loading SAM model...")
-        sam_model = build_sam(checkpoint=sam_ckpt_path).to(device=DEVICE)
-        sam_mask_generator = SamAutomaticMaskGenerator(sam_model)
-    
-    if rmbg_model is None:
-        print("Loading BriaRMBG 2.0 model...")
-        rmbg_model = AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-2.0', trust_remote_code=True)
-        rmbg_model.to(DEVICE)
-        rmbg_model.eval()
-    
+        forced_sam_device = os.getenv("OMNIPART_SAM_DEVICE")
+        if forced_sam_device is not None:
+            sam_device = forced_sam_device
+        elif DEVICE != "cuda":
+            sam_device = DEVICE
+        else:
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            sam_device = "cuda" if total_vram_gb >= SAM_MIN_CUDA_VRAM_GB else "cpu"
+            if sam_device == "cpu":
+                print(
+                    f"Low VRAM detected ({total_vram_gb:.1f} GB). "
+                    "Running SAM on CPU to avoid CUDA OOM."
+                )
+
+        sam_model = build_sam(checkpoint=sam_ckpt_path).to(device=sam_device)
+        sam_model.eval()
+        sam_mask_generator = SamAutomaticMaskGenerator(sam_model, **SAM_GENERATOR_CONFIG)
+
+    print("Core models ready (SAM). Generation models load on demand.")
+
+
+def _generate_sam_masks_with_fallback(image):
+    global sam_device
+    try:
+        return sam_mask_generator.generate(image)
+    except torch.OutOfMemoryError:
+        if sam_device == "cuda":
+            print("SAM hit CUDA OOM. Retrying SAM mask generation on CPU...")
+            torch.cuda.empty_cache()
+            sam_mask_generator.predictor.model.to("cpu")
+            sam_device = "cpu"
+            return sam_mask_generator.generate(image)
+        raise
+
+
+def _prepare_image_with_sam_alpha(image):
+    """Build an RGBA image by using SAM masks as foreground alpha."""
+    rgb_square = resize_and_pad_to_square(image.convert("RGB"))
+    rgb_np = np.array(rgb_square)
+
+    sam_masks = _generate_sam_masks_with_fallback(rgb_np)
+    min_area = int(os.getenv("OMNIPART_SAM_FG_MIN_AREA", "256"))
+    max_area_ratio = float(os.getenv("OMNIPART_SAM_FG_MAX_AREA_RATIO", "0.85"))
+    max_border_touch_ratio = float(os.getenv("OMNIPART_SAM_FG_MAX_BORDER_TOUCH_RATIO", "0.12"))
+    keep_components = int(os.getenv("OMNIPART_SAM_FG_KEEP_COMPONENTS", "3"))
+
+    h, w = rgb_np.shape[:2]
+    frame_area = float(h * w)
+    border_len = float(max(1, (2 * h + 2 * w - 4)))
+
+    alpha_mask = np.zeros(rgb_np.shape[:2], dtype=np.uint8)
+    area_sorted_masks = sorted(sam_masks, key=lambda x: x["area"], reverse=True)
+    selected_masks = []
+
+    for mask_data in area_sorted_masks:
+        area = float(mask_data["area"])
+        if area < min_area:
+            continue
+
+        area_ratio = area / frame_area
+        mask = mask_data["segmentation"]
+        border_touch = (
+            np.sum(mask[0, :])
+            + np.sum(mask[-1, :])
+            + np.sum(mask[1:-1, 0])
+            + np.sum(mask[1:-1, -1])
+        )
+        border_touch_ratio = float(border_touch) / border_len
+
+        # Skip likely background masks: too large or too strongly attached to image borders.
+        if area_ratio > max_area_ratio or border_touch_ratio > max_border_touch_ratio:
+            continue
+
+        selected_masks.append(mask)
+
+    if not selected_masks and len(area_sorted_masks) > 0:
+        # Fallback: choose masks that are smallest-border and moderate-area rather than full-frame masks.
+        scored_masks = []
+        for mask_data in area_sorted_masks:
+            area = float(mask_data["area"])
+            if area < min_area:
+                continue
+            area_ratio = area / frame_area
+            mask = mask_data["segmentation"]
+            border_touch = (
+                np.sum(mask[0, :])
+                + np.sum(mask[-1, :])
+                + np.sum(mask[1:-1, 0])
+                + np.sum(mask[1:-1, -1])
+            )
+            border_touch_ratio = float(border_touch) / border_len
+            score = (1.0 - border_touch_ratio) - abs(area_ratio - 0.35)
+            scored_masks.append((score, mask))
+        scored_masks.sort(key=lambda x: x[0], reverse=True)
+        selected_masks = [m for _, m in scored_masks[:5]]
+
+    for mask in selected_masks:
+        alpha_mask[mask] = 255
+
+    if np.any(alpha_mask):
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        alpha_mask = cv2.morphologyEx(alpha_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        alpha_mask = cv2.morphologyEx(alpha_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # Keep only the largest connected components to suppress isolated background islands.
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((alpha_mask > 0).astype(np.uint8), connectivity=8)
+        if num_labels > 1:
+            comp_indices = list(range(1, num_labels))
+            comp_indices.sort(key=lambda i: stats[i, cv2.CC_STAT_AREA], reverse=True)
+            kept = comp_indices[:max(1, keep_components)]
+            cleaned = np.zeros_like(alpha_mask)
+            for comp_id in kept:
+                cleaned[labels == comp_id] = 255
+            alpha_mask = cleaned
+
+    if not np.any(alpha_mask) and len(area_sorted_masks) > 0:
+        alpha_mask[area_sorted_masks[0]["segmentation"]] = 255
+
+    rgba_np = np.dstack([rgb_np, alpha_mask])
+    return Image.fromarray(rgba_np, mode="RGBA"), sam_masks
+
+
+def _ensure_generation_models_loaded():
+    global bbox_gen_model, part_synthesis_pipeline
+
     if part_synthesis_pipeline is None:
         print("Loading PartSynthesis model...")
         part_synthesis_pipeline = OmniPartImageTo3DPipeline.from_pretrained('omnipart/OmniPart')
         part_synthesis_pipeline.to(DEVICE)
 
     if bbox_gen_model is None:
+        if partfield_ckpt_path_cached is None or bbox_gen_ckpt_path_cached is None:
+            raise RuntimeError("Model checkpoints were not initialized. Call prepare_models(...) first.")
         print("Loading BboxGen model...")
         bbox_gen_config = OmegaConf.load("configs/bbox_gen.yaml").model.args
-        bbox_gen_config.partfield_encoder_path = partfield_ckpt_path
+        bbox_gen_config.partfield_encoder_path = partfield_ckpt_path_cached
         bbox_gen_model = BboxGen(bbox_gen_config)
-        bbox_gen_model.load_state_dict(torch.load(bbox_gen_ckpt_path), strict=False)
+        bbox_gen_model.load_state_dict(torch.load(bbox_gen_ckpt_path_cached), strict=False)
         bbox_gen_model.to(DEVICE)
         bbox_gen_model.eval().half()
-    
-    print("Models ready")
+
+    print("Generation models ready")
 
 
 @spaces.GPU
 def process_image(image_path, threshold, req: gr.Request):
     """Process image and generate initial segmentation"""
-    global size_th
+    global size_th, sam_device
 
     user_dir = os.path.join(TMP_ROOT, str(req.session_hash))
     os.makedirs(user_dir, exist_ok=True)
@@ -86,9 +218,8 @@ def process_image(image_path, threshold, req: gr.Request):
     size_th = threshold
     
     img = Image.open(image_path).convert("RGB")
-    processed_image = prepare_image(img, rmbg_net=rmbg_model.to(DEVICE))
-        
-    processed_image = resize_and_pad_to_square(processed_image)
+    processed_image, sam_masks = _prepare_image_with_sam_alpha(img)
+
     white_bg = Image.new("RGBA", processed_image.size, (255, 255, 255, 255))
     white_bg_img = Image.alpha_composite(white_bg, processed_image.convert("RGBA"))
     image = np.array(white_bg_img.convert('RGB'))
@@ -96,37 +227,18 @@ def process_image(image_path, threshold, req: gr.Request):
     rgba_path = os.path.join(user_dir, f"{img_name}_processed.png")
     processed_image.save(rgba_path)
     
-    print("Generating raw SAM masks without post-processing...")
-    raw_masks = sam_mask_generator.generate(image)
-    
-    raw_sam_vis = np.copy(image)
-    raw_sam_vis = np.ones_like(image) * 255
-    
-    sorted_masks = sorted(raw_masks, key=lambda x: x["area"], reverse=True)
-    
-    for i, mask_data in enumerate(sorted_masks):
-        if mask_data["area"] < size_th:
-            continue
-            
-        color_r = (i * 50 + 80) % 256
-        color_g = (i * 120 + 40) % 256
-        color_b = (i * 180 + 20) % 256
-        color = np.array([color_r, color_g, color_b])
-        
-        mask = mask_data["segmentation"]
-        raw_sam_vis[mask] = color
-    
     visual = Visualizer(image)
-    
+
     group_ids, pre_merge_im = get_sam_mask(
-        image, 
-        sam_mask_generator, 
-        visual, 
-        merge_groups=None, 
+        image,
+        sam_mask_generator,
+        visual,
+        merge_groups=None,
         rgba_image=processed_image,
         img_name=img_name,
         save_dir=user_dir,
-        size_threshold=size_th
+        size_threshold=size_th,
+        precomputed_masks=sam_masks,
     )
     
     pre_merge_path = os.path.join(user_dir, f"{img_name}_mask_pre_merge.png")
@@ -351,6 +463,7 @@ def explode_mesh(mesh, explosion_scale=0.4):
     
 @spaces.GPU(duration=90)
 def generate_parts(state, seed, cfg_strength, req: gr.Request):
+    _ensure_generation_models_loaded()
     explode_factor=0.3
     img_path = state["processed_image"]
     mask_path = state["save_mask_path"]

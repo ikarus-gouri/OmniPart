@@ -43,6 +43,20 @@ pip install -r requirements.txt
 python app.py
 ```
 
+### Background Removal (SAM-first)
+
+The demo uses SAM-first foreground extraction to build alpha masks directly from SAM outputs (no Bria dependency).
+
+Optional environment variables:
+
+```bash
+# Min SAM mask area to include in foreground alpha
+export OMNIPART_SAM_FG_MIN_AREA=256
+
+# Force SAM device when needed: cpu or cuda
+export OMNIPART_SAM_DEVICE=cpu
+```
+
 ### Inference Scripts
 
 If running OmniPart with command lines, you need to obtain the segmentation mask of the input image first. The mask is saved as a .exr file with the shape [h, w, 3], where the last dimension contains the 2D part_id replicated across all three channels.
